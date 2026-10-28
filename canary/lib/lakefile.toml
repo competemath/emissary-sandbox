@@ -1,0 +1,16 @@
+name = "canaryLib"
+defaultTargets = ["CanaryLib"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "v4.34.0-rc2"
+
+[[require]]
+name = "canaryDep"
+git = "https://github.com/competemath/emissary-sandbox"
+rev = "4ca98d3e926f2260f7ec4983a5ae098e6948a0a0"
+subDir = "canary/dep"
+
+[[lean_lib]]
+name = "CanaryLib"

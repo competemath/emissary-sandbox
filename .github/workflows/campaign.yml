@@ -1,0 +1,164 @@
+# A campaign: run emissary-archangel's tooling, at an exact commit, on the canary library in this repository, and ATTEST what came out.
+#
+# Why this repository exists: the tooling of the translation factory is only trusted once it has run for real (every bug of 2026-10-28 was found by a real run, none by CI). Running the code
+# of a pull request needs a place with no secrets and no write access to the factory, so it is here, public, with `contents: read` and nothing else in the job that runs the code.
+#
+#   poll    (cron, every 15 minutes, and on a push to this repository) finds the open pull requests of competemath/emissary-archangel that touch the pipeline, and emissary's main, that have no
+#           campaign yet, and dispatches one campaign per commit
+#   run     builds the canary with the tooling at that commit (vendoring, tolerant build, repair rounds, lint repair) and keeps the raw files; it runs UNTRUSTED code and can only read
+#   judge   a separate job, trusted code of this repository's main: it executes nothing of the change, derives from the commit's file list which capabilities exist, compares the observation
+#           with canary/expected.json (judge/judge.py) and ATTESTS the result (build provenance, Sigstore). The check in emissary (campaign-gate.yml) verifies that attestation.
+#
+# A change under test that makes its own tooling LIE about what it did is outside what this can see: it is code review's to catch (the result names the commit that produced it).
+name: campaign
+run-name: campaign ${{ inputs.emissary_sha || 'poll' }}
+on:
+  workflow_dispatch:
+    inputs:
+      emissary_sha: { description: "full commit sha of competemath/emissary-archangel to run the campaign for", required: false, default: "" }
+  schedule:
+    - cron: "*/15 * * * *"
+  push:
+    branches: [main]
+    paths: ["canary/**", "judge/**", ".github/workflows/campaign.yml"]
+permissions: {}
+defaults:
+  run:
+    shell: bash
+env:
+  EMISSARY: competemath/emissary-archangel
+
+jobs:
+  poll:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: { actions: write, contents: read }
+    steps:
+      - name: Commits that need a campaign
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # the pipeline: what a change to must be checked by a campaign (the same list campaign-gate.yml in emissary uses)
+          touches() { grep -qE '^(scripts/|lib/|gate2/|public/local-claude-bridge\.mjs|\.github/workflows/|sources\.json)' ; }
+          want=""
+          main=$(gh api "repos/$EMISSARY/commits/main" --jq .sha)
+          want="$main"
+          while IFS=$'\t' read -r sha files; do
+            printf '%s\n' "$files" | tr ' ' '\n' | touches && want="$want $sha"
+          done < <(gh pr list -R "$EMISSARY" --state open --limit 50 --json headRefOid,files --jq '.[] | [.headRefOid, ([.files[].path] | join(" "))] | @tsv')
+          gh run list -R "$GITHUB_REPOSITORY" --workflow campaign.yml --limit 300 --json displayTitle,status,conclusion --jq '.[] | select(.status != "completed" or .conclusion == "success" or .conclusion == "failure") | .displayTitle' > seen.txt
+          n=0
+          for sha in $(printf '%s\n' $want | sort -u); do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            # a push to this repository re-checks emissary's main whatever was run before (the canary or the judge may have changed)
+            if [ "$EVENT" = push ] && [ "$sha" = "$main" ]; then :; elif grep -qx "campaign $sha" seen.txt; then continue; fi
+            n=$((n + 1)); [ "$n" -le 4 ] || break
+            echo "dispatch $sha"
+            gh workflow run campaign.yml -R "$GITHUB_REPOSITORY" --ref main -f emissary_sha="$sha"
+          done
+
+  run:
+    if: github.event_name == 'workflow_dispatch' && inputs.emissary_sha != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions: { contents: read }   # this job runs the code under test: it can read, nothing else
+    concurrency: { group: "campaign-${{ inputs.emissary_sha }}", cancel-in-progress: false }
+    env: { SHA: "${{ inputs.emissary_sha }}" }
+    steps:
+      - name: The commit is a commit
+        run: '[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a full commit sha"; exit 1; }'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { persist-credentials: false }
+      - name: emissary-archangel at that commit
+        run: |
+          git clone -q --filter=blob:none --no-checkout "https://github.com/$EMISSARY" emissary
+          git -C emissary fetch -q origin "$SHA" || git -C emissary fetch -q origin "+refs/pull/*/head:refs/remotes/pull/*"
+          git -C emissary checkout -q --detach "$SHA"
+          test "$(git -C emissary rev-parse HEAD)" = "$SHA"
+      - name: elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/0e36a07b9bbcc5381fa6250df109f9a4f94d7bac/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: The canary library and its dependencies
+        run: |
+          cp -R canary/lib lib-run
+          cd lib-run
+          toolchain=$(cat lean-toolchain); elan toolchain install "$toolchain" >/dev/null && elan default "$toolchain"
+          lake update 2>&1 | tail -3
+          lake exe cache get 2>&1 | tail -2
+      - name: The tooling, in the order the whole-library route runs it
+        run: |
+          mkdir raw
+          ROOTS=CanaryLib
+          if [ -f emissary/scripts/bump/vendor_deps.py ]; then
+            ROOTS=$(python3 emissary/scripts/bump/vendor_deps.py --lib lib-run --roots "$ROOTS" --fetch --out raw/vendored.json --print-roots); echo "roots: $ROOTS"
+          fi
+          build() { python3 emissary/scripts/bump/tolerant_build.py --lib lib-run --roots "$ROOTS" --log "raw/build-$1.log" --report "raw/tb-$1.json" --jobs 4 --cache lib-run/.bump-cache || true; }
+          build 0; last=0
+          flags="--deprecations"; grep -q -- "--upstream-duplicates" emissary/scripts/bump/engine.py && flags="$flags --upstream-duplicates"
+          for r in 1 2 3; do
+            python3 emissary/scripts/bump/engine.py repair --lib lib-run --log "raw/build-$last.log" --roots "$ROOTS" --state raw/state.json --round "$r" --out "raw/repair-$r.json" $flags || break
+            [ "$(python3 -c "import json; print(json.load(open('raw/repair-$r.json'))['changed'])")" = True ] || break
+            build "$r"; last=$r
+          done
+          cp "raw/tb-$last.json" raw/tb-final.json
+          if [ -f emissary/scripts/bump/lint_cli.py ]; then
+            python3 -c "import json; print(json.dumps({'text': open('canary/lib/CanaryLib/UsesDep.lean').read()}))" | python3 -I emissary/scripts/bump/lint_cli.py repair > raw/lint.json || true
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with: { name: "raw-${{ inputs.emissary_sha }}", path: raw/, retention-days: 30, if-no-files-found: ignore }
+
+  judge:
+    needs: run
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.emissary_sha != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # trusted code only: nothing of the commit under test is executed here
+    permissions: { contents: read, id-token: write, attestations: write }
+    env: { SHA: "${{ inputs.emissary_sha }}" }
+    steps:
+      - name: The commit is a commit
+        run: '[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::not a full commit sha"; exit 1; }'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with: { name: "raw-${{ inputs.emissary_sha }}", path: raw }
+      - name: Which files the commit has, from a file list; no code of it is run
+        run: |
+          mkdir -p raw
+          git clone -q --filter=blob:none --no-checkout "https://github.com/$EMISSARY" emissary
+          git -C emissary fetch -q origin "$SHA" || git -C emissary fetch -q origin "+refs/pull/*/head:refs/remotes/pull/*"
+          git -C emissary ls-tree -r --name-only "$SHA" | python3 -c "import json, sys; print(json.dumps(sorted(l.strip() for l in sys.stdin)))" > files.json
+      - name: Observe, judge, write the result
+        env: { RUN_RESULT: "${{ needs.run.result }}" }
+        run: |
+          python3 judge/observe.py --raw raw --out obs.json
+          if python3 judge/judge.py --observation obs.json --expected canary/expected.json --files files.json --out verdict.json >/dev/null; then ok=true; else ok=false; fi
+          [ "$RUN_RESULT" = success ] || { ok=false; echo "the run job ended as $RUN_RESULT"; }
+          python3 - <<'PY'
+          import hashlib, json, os
+          v = json.load(open("verdict.json")) if os.path.exists("verdict.json") else {"ok": False, "failures": ["no verdict"]}
+          ok = v["ok"] and os.environ["RUN_RESULT"] == "success"
+          result = {
+              "schema": 1,
+              "emissary_repo": os.environ["EMISSARY"],
+              "emissary_sha": os.environ["SHA"],
+              "sandbox_sha": os.environ["GITHUB_SHA"],
+              "sandbox_run": os.environ["GITHUB_RUN_ID"],
+              "expected_sha256": hashlib.sha256(open("canary/expected.json", "rb").read()).hexdigest(),
+              "run_job": os.environ["RUN_RESULT"],
+              "ok": ok,
+              "verdict": v,
+          }
+          json.dump(result, open("result.json", "w"), indent=1, sort_keys=True)
+          print(json.dumps(result, indent=1, sort_keys=True))
+          PY
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with: { subject-path: result.json }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with: { name: "result-${{ inputs.emissary_sha }}", path: result.json, retention-days: 90 }

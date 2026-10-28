@@ -1,0 +1,16 @@
+{
+  "about": "What the canary library (canary/lib) must look like after emissary-archangel's tooling has run on it, by capability. Changed only by a commit here: see judge/judge.py.",
+  "required_capabilities": ["baseline"],
+  "capabilities": {
+    "baseline": {
+      "requires_file": "scripts/bump/tolerant_build.py",
+      "expect": {
+        "states": {
+          "CanaryLib.Clean": "clean",
+          "CanaryLib.Broken": "errors",
+          "CanaryLib.UsesBroken": "clean"
+        }
+      }
+    }
+  }
+}
