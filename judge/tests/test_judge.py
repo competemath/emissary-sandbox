@@ -99,6 +99,32 @@ class Observe(unittest.TestCase):
             self.assertEqual((obs["vendored"], obs["unsafe"], obs["removed_declarations"], obs["lint_removed_kinds"]), (["Dep.X"], ["Dep.U"], ["Nat.zero_add"], ["#print"]))
 
 
+class TheExpectationItself(unittest.TestCase):
+    """canary/expected.json is data a person edits; it must be well formed and say things the observer can produce."""
+
+    def setUp(self):
+        self.exp = json.loads((HERE.parent.parent / "canary" / "expected.json").read_text())
+
+    def test_it_is_well_formed(self):
+        self.assertTrue(set(self.exp["required_capabilities"]) <= set(self.exp["capabilities"]))
+        for name, cap in self.exp["capabilities"].items():
+            self.assertTrue(cap["requires_file"].startswith("scripts/"), name)
+            self.assertTrue(cap["expect"], name)
+
+    def test_every_key_it_expects_is_one_the_observer_produces(self):
+        produced = {"states", "vendored", "unsafe", "unresolved", "removed_declarations", "lint_removed_kinds", "lint_violations_after"}
+        for name, cap in self.exp["capabilities"].items():
+            self.assertTrue(set(cap["expect"]) <= produced, (name, set(cap["expect"]) - produced))
+
+    def test_every_module_it_names_exists_in_the_canary(self):
+        lib = HERE.parent.parent / "canary" / "lib"
+        dep = HERE.parent.parent / "canary" / "dep"
+        for cap in self.exp["capabilities"].values():
+            for mod in cap["expect"].get("states", {}):
+                base = lib if mod.startswith("CanaryLib") else dep
+                self.assertTrue((base / (mod.replace(".", "/") + ".lean")).exists() or mod == "CanaryLib", mod)
+
+
 class Mutants(unittest.TestCase):
     """Break the judge the way the shortcut would; the tests above must notice."""
 
