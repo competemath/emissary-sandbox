@@ -1,0 +1,5 @@
+name = "canaryDep"
+defaultTargets = ["CanaryDep"]
+
+[[lean_lib]]
+name = "CanaryDep"
