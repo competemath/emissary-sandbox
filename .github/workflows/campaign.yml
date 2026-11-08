@@ -80,7 +80,7 @@ jobs:
           test "$(git -C emissary rev-parse HEAD)" = "$SHA"
       - name: elan
         run: |
-          for try in $(seq 1 20); do curl -sSfL https://raw.githubusercontent.com/leanprover/elan/0e36a07b9bbcc5381fa6250df109f9a4f94d7bac/elan-init.sh | sh -s -- -y --default-toolchain none && break; [ "$try" -lt 20 ] || exit 1; echo "::notice::the Lean installer failed (try $try of 20; its hosts answered 50x for over an hour on 8 Nov 2026): again in 30 s"; sleep 30; done
+          for try in $(seq 1 20); do curl --proto '=https' --tlsv1.2 -sSfL --max-time 120 -o elan-init.sh https://raw.githubusercontent.com/leanprover/elan/0e36a07b9bbcc5381fa6250df109f9a4f94d7bac/elan-init.sh && echo "a620ff1641616222c8d37c54845492004bb84d6877cdbc944dd65c1aa685bf53  elan-init.sh" | sha256sum -c - && timeout 300 sh elan-init.sh -y --default-toolchain none && break; [ "$try" -lt 20 ] || exit 1; echo "::notice::the Lean installer failed (try $try of 20): again in 30 s"; sleep 30; done
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: The canary library and its dependencies
         run: |
