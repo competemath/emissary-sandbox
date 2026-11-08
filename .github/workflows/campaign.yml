@@ -80,13 +80,15 @@ jobs:
           test "$(git -C emissary rev-parse HEAD)" = "$SHA"
       - name: elan
         run: |
-          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/0e36a07b9bbcc5381fa6250df109f9a4f94d7bac/elan-init.sh | sh -s -- -y --default-toolchain none
+          for try in $(seq 1 20); do curl -sSfL https://raw.githubusercontent.com/leanprover/elan/0e36a07b9bbcc5381fa6250df109f9a4f94d7bac/elan-init.sh | sh -s -- -y --default-toolchain none && break; [ "$try" -lt 20 ] || exit 1; echo "::notice::the Lean installer failed (try $try of 20; its hosts answered 50x for over an hour on 8 Nov 2026): again in 30 s"; sleep 30; done
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - name: The canary library and its dependencies
         run: |
           cp -R canary/lib lib-run
           cd lib-run
-          toolchain=$(cat lean-toolchain); elan toolchain install "$toolchain" >/dev/null && elan default "$toolchain"
+          toolchain=$(cat lean-toolchain)
+          for try in $(seq 1 20); do elan toolchain install "$toolchain" >/dev/null && break; [ "$try" -lt 20 ] || exit 1; echo "::notice::the toolchain download failed (try $try of 20): again in 30 s"; sleep 30; done
+          elan default "$toolchain"
           lake update 2>&1 | tail -3
           lake exe cache get 2>&1 | tail -2
       - name: The tooling, in the order the whole-library route runs it
